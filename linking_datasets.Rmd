@@ -1,0 +1,271 @@
+---
+title: "Merging NSSP and CHARS"
+author: "Elyse Kadokura"
+date: "November 29, 2018"
+output: html_document
+params:
+    username: 'ekadokura01'
+    pw: 'asDFjk1@#k15'
+    wd: 'C:/R_Studio/chars/Q2_2018'
+---
+
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(xlsx)
+library(stringr)
+library(httr)
+httr::set_config(config(ssl_verifypeer = 0L))
+library(jsonlite)
+library(tidyverse)
+```
+
+```{r}
+
+setwd('C:/R_Studio/chars')
+
+#importing hospital mapping  and most recent download of the maste facility table
+hosp_codes <- read.csv('hosp_map_full.csv', stringsAsFactors = FALSE)
+MFT <- read.xlsx('MFT_112018.xlsx', sheetIndex = 1, stringsAsFactors=FALSE)
+
+#reading in CHARS datasets
+CHARS_IP <- read.csv("Q2_2018/chars2018Q2_in.csv", stringsAsFactors = FALSE, na.strings = c('', ' ', 0, 'NA'))
+CHARS_Obs <- read.csv("Q2_2018/chars2018Q2_obs.csv", stringsAsFactors = FALSE, na.strings = c('', ' ', 0, 'NA'))
+
+```
+
+```{r}
+#getting information from MFT
+#going to use the id's to pull in ESSENCE data from the API
+#going to use the date activated column to subset teh CHARS data to only visits after the facility started sending to prod
+
+fac_ids <- MFT %>% 
+          filter(Date_Activated<='2018-06-30', !is.na(Date_Activated), Facility_Type=='Emergency Care') %>% 
+          select(C_BioFacility_Id)
+
+#getting facility name and date activated from MFT of facilities 
+MFT <- MFT %>% 
+          filter(Date_Activated<='2018-06-30', !is.na(Date_Activated), Facility_Type=='Emergency Care') %>% 
+          select(Facility_Name, Date_Activated)
+
+colnames(MFT) <- c('Facility.Name', 'Date_Activated')
+
+```
+
+
+```{r}
+#downloading data using ESSENCE API. Downloads the following coluns: Facility name, race, sex, c_biosense_id, zipcode, discharge_date, admi_date, birth_date_time, diagnosis_combo, patient_class_code, patientclassupdates, chiefcomplaintorig
+
+start_date <- '1Jan2018'
+end_date <- '30Jun2018'
+
+essenceAPIURL <- paste0('https://essence.syndromicsurveillance.org/nssp_essence/api/dataDetails?endDate=', end_date, '&percentParam=noPercent&geographySystem=region&datasource=va_er&detector=probrepswitch&startDate=', start_date, '&timeResolution=daily&erFacility=1263&erFacility=1252&erFacility=1313&medicalGroupingSystem=essencesyndromes&userId=1165&hospFacilityType=emergency%20care&aqtTarget=DataDetails&field=ChiefComplaintOrig&field=DischargeDiagnosis&field=Patient_Class_Code&field=PatientClassUpdates&field=Admit_Date_Time&field=HospitalName&field=C_BioSense_ID&field=Medical_Record_Number&field=Discharge_Date_Time&field=Birth_Date_Time&field=Age&field=Sex&field=Race_flat&field=Zipcode&field=DischargeDiagnosisUpdates&field=Diagnosis_Combo&field=HospitalName')
+
+oldids <- regmatches(essenceAPIURL, regexpr('&er.+?&medical', essenceAPIURL))
+newids <- sapply(fac_ids$C_BioFacility_Id, function(x) paste0('&erFacility=', x))
+newids <- paste(newids, collapse='')
+newids <- paste0(newids, "&medical")
+essenceAPIURL <- str_replace(essenceAPIURL, oldids, newids)
+
+#This lapply function loops through the URLs and pulls in the data elements that we specified above. It creates a list of dataframes which we will separate out for ease of use.
+api_response <- GET(essenceAPIURL, authenticate(params$username, params$pw))
+api_response_json <- content(api_response, as = "text")
+api_data <- fromJSON(api_response_json, simplifyDataFrame = TRUE)
+ESSENCE <- api_data$dataDetails
+
+```
+
+### Preparing ESSENCE data for the merge 
+
+Subsetting ESSENCE dataframe to columns of interest. The only columns that we have to merge these two datasets are Facility Name, DOB, Zipcode, Sex, and discharge date. 
+
+```{r}
+#preparing ESSENCE data for linking
+#filtering out all visits that were only outpatient
+ESSENCE <- ESSENCE %>% filter(PatientClassUpdates!='{1};O;')
+
+#Converting date time to date columns,
+ESSENCE$birth_date <- as.Date(ESSENCE$Birth_Date_Time, '%Y-%m-%d')
+ESSENCE$discharge_date <- as.Date(ESSENCE$Discharge_Date_Time, '%Y-%m-%d')
+ESSENCE$admit_date <- as.Date(ESSENCE$Admit_Date_Time, '%Y-%m-%d')
+
+#renaming columns 
+colnames(ESSENCE)[colnames(ESSENCE)=='ZipCode'] <- "Zipcode"
+colnames(ESSENCE)[colnames(ESSENCE)=='HospitalName'] <- "Facility.Name"
+
+#merging ESSENCE data with mft active dates to delete data for visits before active date
+MFT$Facility.Name <- str_replace(MFT$Facility.Name, 'H_', 'WA-H_')
+trim <- function (x) gsub("^\\s+|\\s+$", "", x)
+MFT$Facility.Name <- trim(MFT$Facility.Name)
+
+ESSENCE <- merge(ESSENCE, MFT, by = 'Facility.Name', all.x=TRUE) 
+ESSENCE <- ESSENCE[ESSENCE$Admit_Date_Time!='none', ]
+ESSENCE$include <- ESSENCE$admit_date>ESSENCE$Date_Activated
+ESSENCE <- ESSENCE[ESSENCE$include==TRUE, ]
+
+#saving ESSENCE dataset
+write.csv(params$wd, 'ESSENCE.csv')
+
+```
+
+### Preparing CHARS data for merge
+
+Standardizing columns and vertical merge for inpatient and observation visits. SEQ_NO_ENC is unique within the inpatient dataset and within the observation dataset but they aren't unique across the two. I'm combining the SEQ_NO_ENC and STAYTYPE columns to create unique id's across the two datasets. Also standardizing match columns. 
+
+```{r}
+#Merging CHARS inpatient and observation visits
+CHARS <- rbind(CHARS_IP, CHARS_Obs)
+#rm(CHARS_IP, CHARS_Obs)
+
+#id's are not unique between the inpatient and observation files. creating unique id by concatenating id with staytype
+CHARS$SEQ_NO_ENC <- paste0(CHARS$SEQ_NO, '_', CHARS$STAYTYPE)
+
+#subsetting cHARS datasets to relevant columns
+diag_cols <- colnames(CHARS)[grepl('DIAG[0-9]', colnames(CHARS))]
+race_cols <- colnames(CHARS)[grepl('RACE', colnames(CHARS))]
+CHARS <- CHARS[ , c('SEQ_NO_ENC', 'ZIPCODE', 'SEX', 'DIS_DATE', 'ADM_DATE', 'HOSPITAL', 'AGE', 'DOB', diag_cols, race_cols)]
+
+#mapping chars hospital names to match hospital names in ESSENCE
+CHARS <- merge(CHARS, hosp_codes, by='HOSPITAL', keep.x=TRUE)
+
+#preparing CHARS merge columns
+CHARS$admit_date <- as.Date(CHARS$ADM_DATE, format='%Y-%d-%m', origin="1960-01-01")
+CHARS$ADM_DATE <- as.Date(CHARS$ADM_DATE, format='%Y-%d-%m', origin="1960-01-01")
+CHARS$discharge_date <- as.Date(CHARS$DIS_DATE, format='%Y-%d-%m', origin="1960-01-01")
+CHARS$DIS_DATE <- as.Date(CHARS$DIS_DATE, format='%Y-%d-%m', origin="1960-01-01")
+CHARS$birth_date <- as.Date(CHARS$DOB, format='%Y-%d-%m', origin="1960-01-01")
+colnames(CHARS)[colnames(CHARS)=='ZIPCODE'] <- "Zipcode"
+colnames(CHARS)[colnames(CHARS)=='SEX'] <- "Sex"
+
+#deleting CHARS visits that happened before facility started sending to ESSENCE
+CHARS <- merge(CHARS, MFT, by='Facility.Name')
+CHARS$include <- CHARS$admit_date>CHARS$Date_Activated
+CHARS <- CHARS[CHARS$include=='TRUE', ]
+CHARS[is.na(CHARS$admit_date), 'include'] <- NA
+CHARS <- CHARS[CHARS$include=='TRUE' & !is.na(CHARS$include), ]
+CHARS <- CHARS[CHARS$admit_date>'2017-12-31', ]
+```
+
+### Duplicate merge issues
+
+I want to take a look at how many visits in CHARS and how many visits in NSSP have the same values for ALL of the values we're merging on. This would cause multiple matches upon merging.  
+
+```{r}
+#since we can't match on unique id's, I'm checking how many visits are duplicate on the match columns in both ESSENCE and CHARS datasets
+dup_CHARS <- CHARS %>% 
+          filter(!is.na(birth_date), !is.na(discharge_date), !is.na(Zipcode), !is.na(Sex)) %>%
+          group_by(Facility.Name, birth_date, discharge_date, Zipcode, Sex) %>%
+          summarise(n=n()) %>%
+          filter(n>1)
+
+dup_NSSP <- ESSENCE %>% 
+          filter(!is.na(birth_date), !is.na(discharge_date), !is.na(Zipcode), !is.na(Sex)) %>%
+          group_by(Facility.Name, birth_date, discharge_date, Zipcode, Sex) %>%
+          summarise(n=n()) %>%
+          filter(n>1)
+```
+
+There are a lot of nssp duplicates. I believe this is at least partially due to the patient class. Going to try to find patient class and exclude from dataset before match attempt
+
+```{r}
+
+merge_col <- c('Facility.Name', 'Sex', 'Zipcode', 'discharge_date', 'birth_date')
+
+merge <- merge(dup_NSSP, ESSENCE[ , c(merge_col, 'Patient_Class_Code', 'C_BioSense_ID', 'Medical_Record_Number')], all.x=TRUE, by=merge_col)
+
+table(merge$Patient_Class_Code)
+
+```
+
+Most of the duplicates are E patent class so decided not to exclude any visits before merge. Will remove duplicate matches after merge. Using unique id columns (SEQ_NO_ENC for CHARS, C_BioSense_ID for NSSP) to detect multiple matches. 
+
+```{r}
+
+#merging based on zipcode, discharge date, sex, faclity name, and birth date
+CHARS_ESSENCE <- merge(CHARS, ESSENCE, by=merge_col)
+
+#subsetting multiple matches based on unique id's >1
+dup_chars_ids <- CHARS_ESSENCE %>% group_by(SEQ_NO_ENC) %>% summarise(n=n()) %>% filter(n>1)
+dup_nssp_ids <- CHARS_ESSENCE %>% group_by(C_BioSense_ID) %>% summarise(n=n()) %>% filter(n>1)
+
+dup_CHARS <- CHARS_ESSENCE %>% filter(SEQ_NO_ENC %in% dup_chars_ids$SEQ_NO_ENC)
+dup_NSSP <- CHARS_ESSENCE %>% filter(C_BioSense_ID %in% dup_nssp_ids$C_BioSense_ID)
+
+```
+
+There were 238 merges when subsetting based on >1 SEQ_NO_ENC and 142 based on >1 C_BioSense_ID. Removing these from the merged dataset as there's no way to see which one is accurate without looking at CC or DG. filtering these out 
+
+```{r}
+#removing multiple matches
+de_dup <- CHARS_ESSENCE %>% 
+          filter(!(C_BioSense_ID %in% dup_nssp_ids$C_BioSense_ID), !(SEQ_NO_ENC %in% dup_chars_ids$SEQ_NO_ENC)) 
+
+```
+
+### Weeding out more non matches
+Trying to weed out other obvious non matches by looking at difference in admit date between the two datasets. CHARS is missing admit date for many of their visits. Decided to filter out matches with >3 days difference between admit dates. 
+
+```{r}
+#finding difference in time in admit dates between ESSENCE and CHARS visits
+de_dup$admit_NSSP <- as.Date(de_dup$Admit_Date_Time)
+de_dup$admit_chars <- as.Date(de_dup$ADM_DATE, '%m/%d/%Y')
+de_dup$diff_date <- difftime(de_dup$admit_NSSP, de_dup$admit_chars, unit='days')
+table(de_dup$diff_date)
+
+#after looking at diff_date, there are many visits that have admit dates and times 4 days apart and after this it tapers off. used 4 days as cutoff
+de_dup <- de_dup %>% filter(4>diff_date|is.na(diff_date), diff_date>-4|is.na(diff_date))
+
+#saving linked dataset
+write.csv(de_dup, paste0(params$wd, '/linked.csv'))
+
+```
+
+### Creating datasets of visits that could not be matched 
+
+There were two different types of visits that were not matched. The first could not be matched because there were multiple records with the exact same values across all of the match columns resulting in multiple matches and thus had to be removed from the final dataset. The second were not matched because there were no direct matches across all of the match columns. I want to create a column to keep track of which is which (1 for the first case and 0 for the second). 
+
+```{r}
+
+#marking unlinked CHARS visits with why they weren't linked. 1=multiple records, 0=no direct match
+CHARS_not_linked <- CHARS[!(CHARS$SEQ_NO_ENC %in% de_dup$SEQ_NO_ENC), ]
+CHARS_not_linked$reason <- 0
+CHARS_not_linked[CHARS_not_linked$SEQ_NO_ENC %in% dup_chars_ids$SEQ_NO_ENC, 'reason'] <- 1
+write.csv(CHARS_not_linked, paste0(params$wd, '/CHARS_not_linked.csv'))
+
+#marking unlinked CHARS visits with why they weren't linked. 1=multiple records, 0=no direct match
+ESSENCE_not_linked <- ESSENCE[!(ESSENCE$C_BioSense_ID %in% de_dup$C_BioSense_ID), ]
+ESSENCE_not_linked$reason <- 0
+ESSENCE_not_linked[ESSENCE_not_linked$C_BioSense_ID %in% dup_nssp_ids$C_BioSense_ID, 'reason'] <- 1
+write.csv(ESSENCE_not_linked, paste0(params$wd, '/ESSENCE_not_linked.csv'))
+```
+
+Looking at prelim results of what proportion of visits matched from each facility. I'm going to do some fuzzy matching later, but want to get an idea of the direct matches. 
+
+```{r}
+#looking at proportions of 
+denom <- as.data.frame(table(CHARS_not_linked[CHARS_not_linked$reason==0, 'Facility.Name']))
+num <- as.data.frame(table(de_dup$Facility.Name))
+
+table <- merge(num, denom, by='Var1')
+table$Freq.y <- table$Freq.x+table$Freq.y
+table$prop <- table$Freq.x/table$Freq.y
+rm(denom, num)
+View(table)
+
+```
+
+The following hospitals had 0 matches:
+
+* WA-H_Columbia Basin Hospital - Not in NSSP
+* WA-H_EvergreenHealth Kirkland - Not in NSSP
+* WA-H_Legacy Health Salmon Creek - Not sending DOB
+* WA-H_Lourdes Medical Center - Not in NSSP
+* WA-H_Ocean Beach Hospital - Not in NSSP
+* WA-H_Odessa Memorial Healthcare Center - Only one inpatient visit
+* WA-H_Skagit Valley Hospital - Not in NSSP
+
+
+
+
+
